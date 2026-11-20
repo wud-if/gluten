@@ -198,13 +198,28 @@ public class StreamExecGroupAggregate extends StreamExecAggregateBase {
             .collect(Collectors.toList());
     List<Integer> keyIndexes = Arrays.stream(grouping).boxed().collect(Collectors.toList());
     PartitionFunctionSpec keySelectorSpec = new HashPartitionFunctionSpec(inputType, keyIndexes);
+    List<io.github.zhztheplayer.velox4j.aggregate.Aggregate> veloxAggregates =
+        org.apache.gluten.rexnode.AggregateCallConverter.toAggregates(aggCalls, inputType);
     PlanNode aggsHandlerNode =
         new GroupAggsHandlerNode(
-            PlanNodeIdGenerator.newId(), outputType, generateUpdateBefore, needRetraction);
+            PlanNodeIdGenerator.newId(),
+            inputType,
+            outputType,
+            veloxAggregates,
+            generateUpdateBefore,
+            needRetraction);
     // TODO: velox agg may not equal to flink
+    java.util.List<io.github.zhztheplayer.velox4j.type.Type> keyTypes =
+        keyIndexes.stream().map(inputType.getChildren()::get).collect(Collectors.toList());
+    io.github.zhztheplayer.velox4j.stateful.KeyedStateSpec keyedStateSpec =
+        new io.github.zhztheplayer.velox4j.stateful.KeyedStateSpec(keyIndexes, keyTypes);
     PlanNode aggregation =
         new GroupAggregationNode(
-            PlanNodeIdGenerator.newId(), aggsHandlerNode, keySelectorSpec, outputType);
+            PlanNodeIdGenerator.newId(),
+            aggsHandlerNode,
+            keySelectorSpec,
+            keyedStateSpec,
+            outputType);
     final OneInputStreamOperator operator =
         new GlutenOneInputOperator(
             new StatefulPlanNode(aggregation.getId(), aggregation),
