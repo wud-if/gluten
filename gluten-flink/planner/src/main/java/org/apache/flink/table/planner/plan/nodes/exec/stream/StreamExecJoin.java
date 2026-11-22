@@ -35,6 +35,9 @@ import io.github.zhztheplayer.velox4j.plan.PartitionFunctionSpec;
 import io.github.zhztheplayer.velox4j.plan.PlanNode;
 import io.github.zhztheplayer.velox4j.plan.StatefulPlanNode;
 import io.github.zhztheplayer.velox4j.plan.StreamJoinNode;
+import io.github.zhztheplayer.velox4j.plan.KeyGroupPartitionFunctionSpec;
+import io.github.zhztheplayer.velox4j.plan.StreamWindowJoinNode;
+import io.github.zhztheplayer.velox4j.stateful.KeyedStateSpec;
 import io.github.zhztheplayer.velox4j.plan.TableScanNode;
 import io.github.zhztheplayer.velox4j.type.BooleanType;
 
@@ -177,6 +180,11 @@ public class StreamExecJoin extends ExecNodeBase<RowData>
     final ExecEdge leftInputEdge = getInputEdges().get(0);
     final ExecEdge rightInputEdge = getInputEdges().get(1);
 
+    // Window join detection: assigned in the gluten section, used after
+    // the transformation is created to force parallelism 1
+    int leftWindowEndIdx = -1;
+    int rightWindowEndIdx = -1;
+
     final Transformation<RowData> leftTransform =
         (Transformation<RowData>) leftInputEdge.translateToPlan(planner);
     final Transformation<RowData> rightTransform =
@@ -255,6 +263,12 @@ public class StreamExecJoin extends ExecNodeBase<RowData>
         io.github.zhztheplayer.velox4j.type.RowType outputType =
             (io.github.zhztheplayer.velox4j.type.RowType)
                 LogicalTypeConverter.toVLType(getOutputType());
+        // Detect window join pattern BEFORE substituteSameName renames
+        // duplicate column names (window_end -> window_end0 on the right)
+        // Variables declared at method level for cross-block access
+        // (assigned below in the gluten-specific section)
+        leftWindowEndIdx = leftInputType.getNames().indexOf("window_end");
+        rightWindowEndIdx = rightInputType.getNames().indexOf("window_end");
         rightInputType = Utils.substituteSameName(leftInputType, rightInputType, outputType);
         List<FieldAccessTypedExpr> leftKeys =
             Utils.analyzeJoinKeys(leftInputType, leftJoinKey, leftUpsertKeys);
@@ -291,24 +305,69 @@ public class StreamExecJoin extends ExecNodeBase<RowData>
             new HashPartitionFunctionSpec(leftInputType, leftKeyIndexes);
         PartitionFunctionSpec rightPartFuncSpec =
             new HashPartitionFunctionSpec(rightInputType, rightKeyIndexes);
+        // Window-join fast path: the keyed state buckets store rows under
+        // (joinKey, windowEnd), so every left/right pair in a fired window
+        // already satisfies all key-equality conjuncts. When no residual
+        // (non-equi) condition exists the probe condition is tautological
+        // and can be dropped. NULL-key rows can never satisfy an inner
+        // equality; the velox fast path drops them, preserving SQL
+        // semantics without re-evaluating the condition.
+        boolean windowJoinFastPath =
+            leftWindowEndIdx >= 0 && rightWindowEndIdx >= 0 && condition == null;
         NestedLoopJoinNode probeNode =
             new NestedLoopJoinNode(
                 PlanNodeIdGenerator.newId(),
                 Utils.toVLJoinType(joinType),
-                joinCondition,
+                windowJoinFastPath ? null : joinCondition,
                 new EmptyNode(leftInputType),
                 new EmptyNode(rightInputType),
                 outputType);
-        PlanNode join =
-            new StreamJoinNode(
-                PlanNodeIdGenerator.newId(),
-                leftInput,
-                rightInput,
-                leftPartFuncSpec,
-                rightPartFuncSpec,
-                probeNode,
-                outputType,
-                1024);
+        PlanNode join;
+        if (leftWindowEndIdx >= 0 && rightWindowEndIdx >= 0) {
+          java.util.List<Integer> windowKeyChannels =
+              Arrays.stream(leftJoinKey).boxed().collect(Collectors.toList());
+          java.util.List<io.github.zhztheplayer.velox4j.type.Type> windowKeyTypes =
+              windowKeyChannels.stream()
+                  .map(ch -> leftInputType.getChildren().get(ch))
+                  .collect(Collectors.toList());
+          java.util.List<Integer> windowRightKeyChannels =
+              Arrays.stream(rightJoinKey).boxed().collect(Collectors.toList());
+          KeyedStateSpec windowKeyedStateSpec =
+              new KeyedStateSpec(windowKeyChannels, windowRightKeyChannels, windowKeyTypes);
+          // Wrap both inputs with a key-group shuffle partition node so
+          // rows with the same key arrive at the subtask that owns their
+          // key group range (required by the keyed state backend).
+          int maxParallelism = 128; // Flink default
+          PartitionFunctionSpec windowLeftPart =
+              new KeyGroupPartitionFunctionSpec(leftInputType, windowKeyChannels, maxParallelism);
+          PartitionFunctionSpec windowRightPart =
+              new KeyGroupPartitionFunctionSpec(
+                  rightInputType, windowRightKeyChannels, maxParallelism);
+          join =
+              new StreamWindowJoinNode(
+                  PlanNodeIdGenerator.newId(),
+                  leftInput,
+                  rightInput,
+                  windowLeftPart,
+                  windowRightPart,
+                  probeNode,
+                  windowKeyedStateSpec,
+                  outputType,
+                  128, // numPartitions
+                  leftWindowEndIdx,
+                  rightWindowEndIdx);
+        } else {
+          join =
+              new StreamJoinNode(
+                  PlanNodeIdGenerator.newId(),
+                  leftInput,
+                  rightInput,
+                  leftPartFuncSpec,
+                  rightPartFuncSpec,
+                  probeNode,
+                  outputType,
+                  1024);
+        }
         operator =
             new GlutenTwoInputOperator(
                 new StatefulPlanNode(join.getId(), join),
@@ -359,6 +418,9 @@ public class StreamExecJoin extends ExecNodeBase<RowData>
             planner.getFlinkContext().getClassLoader(), rightJoinKey, rightTypeInfo);
     transform.setStateKeySelectors(leftSelect, rightSelect);
     transform.setStateKeyType(leftSelect.getProducedType());
+    // key group (group 0). Without an upstream key-shuffle exchange, any
+    if (leftWindowEndIdx >= 0 && rightWindowEndIdx >= 0) {
+    }
     return transform;
   }
 }

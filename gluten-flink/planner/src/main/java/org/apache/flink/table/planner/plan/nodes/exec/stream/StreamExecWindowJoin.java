@@ -16,6 +16,8 @@
  */
 package org.apache.flink.table.planner.plan.nodes.exec.stream;
 
+import org.apache.gluten.rexnode.RexConversionContext;
+import org.apache.gluten.rexnode.RexNodeConverter;
 import org.apache.gluten.rexnode.Utils;
 import org.apache.gluten.streaming.api.operators.GlutenTwoInputOperatorFactory;
 import org.apache.gluten.table.runtime.operators.GlutenTwoInputOperator;
@@ -23,6 +25,7 @@ import org.apache.gluten.util.LogicalTypeConverter;
 import org.apache.gluten.util.PlanNodeIdGenerator;
 
 import io.github.zhztheplayer.velox4j.connector.ExternalStreamTableHandle;
+import io.github.zhztheplayer.velox4j.expression.CallTypedExpr;
 import io.github.zhztheplayer.velox4j.expression.FieldAccessTypedExpr;
 import io.github.zhztheplayer.velox4j.expression.TypedExpr;
 import io.github.zhztheplayer.velox4j.plan.EmptyNode;
@@ -33,6 +36,9 @@ import io.github.zhztheplayer.velox4j.plan.PlanNode;
 import io.github.zhztheplayer.velox4j.plan.StatefulPlanNode;
 import io.github.zhztheplayer.velox4j.plan.StreamWindowJoinNode;
 import io.github.zhztheplayer.velox4j.plan.TableScanNode;
+import io.github.zhztheplayer.velox4j.stateful.KeyedStateSpec;
+import io.github.zhztheplayer.velox4j.type.BooleanType;
+import io.github.zhztheplayer.velox4j.type.Type;
 
 import org.apache.flink.FlinkVersion;
 import org.apache.flink.api.dag.Transformation;
@@ -55,8 +61,6 @@ import org.apache.flink.table.planner.plan.nodes.exec.SingleTransformationTransl
 import org.apache.flink.table.planner.plan.nodes.exec.spec.JoinSpec;
 import org.apache.flink.table.planner.plan.nodes.exec.utils.ExecNodeUtil;
 import org.apache.flink.table.planner.plan.utils.JoinUtil;
-import org.apache.flink.table.planner.plan.utils.KeySelectorUtil;
-import org.apache.flink.table.runtime.keyselector.RowDataKeySelector;
 import org.apache.flink.table.runtime.typeutils.InternalTypeInfo;
 import org.apache.flink.table.types.logical.RowType;
 
@@ -64,6 +68,9 @@ import org.apache.flink.shaded.guava31.com.google.common.collect.Lists;
 import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.annotation.JsonCreator;
 import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.annotation.JsonProperty;
 
+import org.apache.calcite.rex.RexNode;
+
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
@@ -171,9 +178,6 @@ public class StreamExecWindowJoin extends ExecNodeBase<RowData>
     final int[] leftJoinKey = joinSpec.getLeftKeys();
     final int[] rightJoinKey = joinSpec.getRightKeys();
 
-    final InternalTypeInfo<RowData> leftTypeInfo = InternalTypeInfo.of(leftType);
-    final InternalTypeInfo<RowData> rightTypeInfo = InternalTypeInfo.of(rightType);
-
     // --- Begin Gluten-specific code changes ---
     io.github.zhztheplayer.velox4j.type.RowType leftInputType =
         (io.github.zhztheplayer.velox4j.type.RowType) LogicalTypeConverter.toVLType(leftType);
@@ -188,6 +192,33 @@ public class StreamExecWindowJoin extends ExecNodeBase<RowData>
     List<FieldAccessTypedExpr> rightKeys =
         Utils.analyzeJoinKeys(rightInputType, rightJoinKey, List.of());
     TypedExpr joinCondition = Utils.generateJoinEqualCondition(leftKeys, rightKeys);
+
+    // Fold the residual non-equi condition into the probe condition. The
+    // condition's input refs span the join input (left columns followed by
+    // the right columns after same-name substitution), not the projected
+    // output, so the names context is built from the join input.
+    RexNode condition = joinSpec.getNonEquiCondition().orElse(null);
+    if (condition != null) {
+      List<String> joinInputNames = new ArrayList<>(leftInputType.getNames());
+      joinInputNames.addAll(rightInputType.getNames());
+      RexConversionContext conversionContext = new RexConversionContext(joinInputNames);
+      TypedExpr nonEqual = RexNodeConverter.toTypedExpr(condition, conversionContext);
+      joinCondition =
+          joinCondition == null
+              ? nonEqual
+              : new CallTypedExpr(new BooleanType(), List.of(joinCondition, nonEqual), "and");
+    }
+
+    // Fail loud on null-safe key equality: the join condition needs
+    // null-safe comparison support first. Ordinary equi keys (the default)
+    // are handled by the operator's key semantics.
+    // TODO(L1): support null-safe equi keys (IS_NOT_DISTINCT_FROM) in the
+    // window join condition.
+    for (boolean filterNull : joinSpec.getFilterNulls()) {
+      if (!filterNull) {
+        throw new TableException("WindowJoin does not support null-safe equi keys yet");
+      }
+    }
 
     PlanNode leftInput =
         new TableScanNode(
@@ -208,13 +239,48 @@ public class StreamExecWindowJoin extends ExecNodeBase<RowData>
         new HashPartitionFunctionSpec(leftInputType, leftKeyIndexes);
     PartitionFunctionSpec rightPartFuncSpec =
         new HashPartitionFunctionSpec(rightInputType, rightKeyIndexes);
+
+    // The keyed-state key channels: the remaining equi keys after the
+    // planner stripped the window equality pairs. A pure window join has no
+    // equi key left; the window start column compensates (rows of one
+    // window share the window start, so the grouping equals the empty key
+    // for every pairing the join can emit).
+    List<Integer> specKeyChannels;
+    List<Integer> specRightKeyChannels;
+    List<Type> specKeyTypes;
+    if (leftJoinKey.length == 0) {
+      int leftWindowStartIndex = ((WindowAttachedWindowingStrategy) leftWindowing).getWindowStart();
+      int rightWindowStartIndex =
+          ((WindowAttachedWindowingStrategy) rightWindowing).getWindowStart();
+      specKeyChannels = List.of(leftWindowStartIndex);
+      specRightKeyChannels = List.of(rightWindowStartIndex);
+      specKeyTypes = List.of(leftInputType.getChildren().get(leftWindowStartIndex));
+    } else {
+      specKeyChannels = leftKeyIndexes;
+      specRightKeyChannels = rightKeyIndexes;
+      specKeyTypes = new ArrayList<>(leftJoinKey.length);
+      for (int keyChannel : leftJoinKey) {
+        specKeyTypes.add(leftInputType.getChildren().get(keyChannel));
+      }
+    }
+    for (Type keyType : specKeyTypes) {
+      if (keyType instanceof io.github.zhztheplayer.velox4j.type.RowType
+          || keyType instanceof io.github.zhztheplayer.velox4j.type.ArrayType
+          || keyType instanceof io.github.zhztheplayer.velox4j.type.MapType) {
+        throw new TableException(
+            "WindowJoin does not support complex-typed equi keys yet: " + keyType);
+      }
+    }
+    KeyedStateSpec keyedStateSpec =
+        new KeyedStateSpec(specKeyChannels, specRightKeyChannels, specKeyTypes);
+
     NestedLoopJoinNode probeNode =
         new NestedLoopJoinNode(
             PlanNodeIdGenerator.newId(),
             Utils.toVLJoinType(joinSpec.getJoinType()),
             joinCondition,
-            new EmptyNode(rightInputType),
             new EmptyNode(leftInputType),
+            new EmptyNode(rightInputType),
             outputType);
     PlanNode join =
         new StreamWindowJoinNode(
@@ -224,6 +290,7 @@ public class StreamExecWindowJoin extends ExecNodeBase<RowData>
             leftPartFuncSpec,
             rightPartFuncSpec,
             probeNode,
+            keyedStateSpec,
             outputType,
             1024,
             leftWindowEndIndex,
@@ -254,15 +321,8 @@ public class StreamExecWindowJoin extends ExecNodeBase<RowData>
             0L,
             false);
 
-    // set KeyType and Selector for state
-    RowDataKeySelector leftSelect =
-        KeySelectorUtil.getRowDataSelector(
-            planner.getFlinkContext().getClassLoader(), leftJoinKey, leftTypeInfo);
-    RowDataKeySelector rightSelect =
-        KeySelectorUtil.getRowDataSelector(
-            planner.getFlinkContext().getClassLoader(), rightJoinKey, rightTypeInfo);
-    transform.setStateKeySelectors(leftSelect, rightSelect);
-    transform.setStateKeyType(leftSelect.getProducedType());
+    // The velox side routes by key group on its own; the transformation
+    // must stay non-keyed, as the contract requires.
     return transform;
   }
 }

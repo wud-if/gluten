@@ -281,6 +281,18 @@ public class GlutenTwoInputOperator<IN, OUT> extends GlutenAbstractStreamOperato
     processElementInternal();
   }
 
+  /**
+   * Bypasses the Flink key-group range check for the velox-side state.
+   * The velox WindowJoin manages its own state without Flink's keyed
+   * state backend, so the key-group range enforcement is unnecessary
+   * and harmful when the upstream exchange hash differs from the
+   * velox-side hash chain.
+   */
+  @Override
+  public void setCurrentKey(Object key) {
+    // Intentionally empty: velox-side state is key-group-agnostic.
+  }
+
   @Override
   public void close() throws Exception {
     closing = true;

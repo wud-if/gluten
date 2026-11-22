@@ -16,7 +16,6 @@
  */
 package org.apache.flink.table.planner.plan.nodes.exec.stream;
 
-import org.apache.gluten.rexnode.AggregateCallConverter;
 import org.apache.gluten.rexnode.Utils;
 import org.apache.gluten.rexnode.WindowUtils;
 import org.apache.gluten.util.LogicalTypeConverter;
@@ -167,6 +166,83 @@ public class StreamExecGlobalWindowAggregate extends StreamExecWindowAggregateBa
     this.needRetraction = Optional.ofNullable(needRetraction).orElse(false);
   }
 
+  /** Builds merge-phase aggregates over a partial-result input schema. */
+  private static List<Aggregate> toMergeAggregates(
+      AggregateCall[] aggregateCalls,
+      io.github.zhztheplayer.velox4j.type.RowType partialsType,
+      int numGroupingKeys) {
+    List<Aggregate> merges = new java.util.ArrayList<>(aggregateCalls.length);
+    for (int i = 0; i < aggregateCalls.length; i++) {
+      AggregateCall call = aggregateCalls[i];
+      checkArgument(!call.isDistinct(), "distinct aggregate not supported in merge phase yet");
+      String fn = call.getAggregation().getName().toUpperCase(java.util.Locale.ROOT);
+      String mergeFn;
+      switch (fn) {
+        case "COUNT":
+        case "SUM":
+          mergeFn = "sum";
+          break;
+        case "MAX":
+          mergeFn = "max";
+          break;
+        case "MIN":
+          mergeFn = "min";
+          break;
+        default:
+          throw new UnsupportedOperationException(
+              "Global window agg merge not supported for aggregate function: " + fn);
+      }
+      int fieldIndex = numGroupingKeys + i;
+      io.github.zhztheplayer.velox4j.type.Type fieldType =
+          partialsType.getChildren().get(fieldIndex);
+      String fieldName = partialsType.getNames().get(fieldIndex);
+      io.github.zhztheplayer.velox4j.expression.FieldAccessTypedExpr input =
+          io.github.zhztheplayer.velox4j.expression.FieldAccessTypedExpr.create(
+              fieldType, fieldName);
+      io.github.zhztheplayer.velox4j.expression.CallTypedExpr mergeCall =
+          new io.github.zhztheplayer.velox4j.expression.CallTypedExpr(
+              (io.github.zhztheplayer.velox4j.type.Type)
+                  org.apache.gluten.rexnode.RexNodeConverter.toType(call.getType()),
+              java.util.Collections.singletonList(input),
+              mergeFn);
+      merges.add(
+          new Aggregate(
+              mergeCall,
+              java.util.Collections.singletonList(fieldType),
+              null,
+              java.util.List.of(),
+              java.util.List.of(),
+              false));
+    }
+    return merges;
+  }
+
+  /**
+   * Output type of the merge-over-partials step: (grouping keys, merged agg values with the final
+   * agg names). Feeds the op() aggregation node both as its declared source type and as the schema
+   * of the rows it aggregates (fresh partial merges plus its own previous output read from keyed
+   * state).
+   */
+  private static io.github.zhztheplayer.velox4j.type.RowType buildLocalAggOutputType(
+      io.github.zhztheplayer.velox4j.type.RowType partialsType,
+      int numGroupingKeys,
+      AggregateCall[] aggregateCalls,
+      List<String> aggNames) {
+    List<String> names = new java.util.ArrayList<>();
+    List<io.github.zhztheplayer.velox4j.type.Type> types = new java.util.ArrayList<>();
+    for (int i = 0; i < numGroupingKeys; i++) {
+      names.add(partialsType.getNames().get(i));
+      types.add(partialsType.getChildren().get(i));
+    }
+    for (int i = 0; i < aggregateCalls.length; i++) {
+      names.add(aggNames.get(i));
+      types.add(
+          (io.github.zhztheplayer.velox4j.type.Type)
+              org.apache.gluten.rexnode.RexNodeConverter.toType(aggregateCalls[i].getType()));
+    }
+    return new io.github.zhztheplayer.velox4j.type.RowType(names, types);
+  }
+
   @SuppressWarnings("unchecked")
   @Override
   protected Transformation<RowData> translateToPlanInternal(
@@ -196,13 +272,27 @@ public class StreamExecGlobalWindowAggregate extends StreamExecWindowAggregateBa
         (io.github.zhztheplayer.velox4j.type.RowType)
             LogicalTypeConverter.toVLType(getOutputType());
     List<FieldAccessTypedExpr> groupingKeys = Utils.generateFieldAccesses(inputType, grouping);
-    List<Aggregate> aggregates = AggregateCallConverter.toAggregates(aggCalls, inputType);
+    // Merge-phase aggregates (see toMergeAggregates): the local
+    // pre-aggregator already evaluated the original aggregates over the
+    // raw input rows; the global side receives partial rows whose columns
+    // at [grouping.length, grouping.length + aggCalls.length) carry the
+    // partial results, so the global must merge the partial VALUES instead
+    // of recomputing the original aggregate over partial rows (which
+    // counts partial rows; verified e2e: 3 input rows per (id, window)
+    // produced cnt=1 instead of 3).
+    List<Aggregate> aggregates = toMergeAggregates(aggCalls, inputType, grouping.length);
     checkArgument(outputType.getNames().size() >= grouping.length + aggCalls.length);
     List<String> aggNames =
         outputType.getNames().stream()
             .skip(grouping.length)
             .limit(aggCalls.length)
             .collect(Collectors.toList());
+    // The merge-over-partials (localAgg) node outputs (grouping keys, merged
+    // agg values) with the final agg names; the op() node consumes rows of
+    // this type (its own previous output kept in keyed state), so its
+    // aggregates and source type must use these names/types.
+    io.github.zhztheplayer.velox4j.type.RowType localAggOutputType =
+        buildLocalAggOutputType(inputType, grouping.length, aggCalls, aggNames);
     List<Integer> keyIndexes = Arrays.stream(grouping).boxed().collect(Collectors.toList());
     PartitionFunctionSpec keySelectorSpec = new HashPartitionFunctionSpec(inputType, keyIndexes);
     // TODO: support more window types.
@@ -227,9 +317,9 @@ public class StreamExecGlobalWindowAggregate extends StreamExecWindowAggregateBa
             groupingKeys,
             groupingKeys,
             aggNames,
-            aggregates,
+            toMergeAggregates(aggCalls, localAggOutputType, grouping.length),
             false,
-            List.of(new EmptyNode(inputType)),
+            List.of(new EmptyNode(localAggOutputType)),
             null,
             List.of());
     PlanNode localAgg =
@@ -262,7 +352,8 @@ public class StreamExecGlobalWindowAggregate extends StreamExecWindowAggregateBa
             windowing.isRowtime(),
             rowtimeIndex,
             windowStartIndex,
-            windowEndIndex);
+            windowEndIndex,
+            false);
     final LogicalType[] accTypes = convertToLogicalTypes(globalAggInfoList.getAccTypes());
     final RowDataKeySelector selector =
         KeySelectorUtil.getRowDataSelector(

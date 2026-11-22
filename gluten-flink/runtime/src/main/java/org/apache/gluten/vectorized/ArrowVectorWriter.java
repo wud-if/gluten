@@ -128,6 +128,11 @@ public abstract class ArrowVectorWriter {
     throw new UnsupportedOperationException("writeArray is not supported");
   }
 
+  /** Writes a null at the current row position, advancing the writer. */
+  public void writeNull() {
+    throw new UnsupportedOperationException("writeNull is not supported");
+  }
+
   int getValueCount() {
     return valueCount;
   }
@@ -252,6 +257,12 @@ abstract class BaseVectorWriter<T extends FieldVector, V> extends ArrowVectorWri
     } else {
       setValue(valueCount, getValue(rowData, fieldIndex));
     }
+    valueCount++;
+  }
+
+  @Override
+  public void writeNull() {
+    this.typedVector.setNull(valueCount);
     valueCount++;
   }
 
@@ -517,6 +528,37 @@ class StructVectorWriter extends BaseVectorWriter<StructVector, RowData> {
     for (int i = 0; i < fieldCount; ++i) {
       fieldWriters.get(i).write(i, value);
     }
+  }
+
+  /**
+   * The null branch must go through writeNull so every child writer stays
+   * slot-aligned with the struct: arrow struct children carry one slot per
+   * parent row regardless of nullness, and skipping the child write leaves
+   * uninitialized memory in the child tail that later reads as garbage.
+   */
+  @Override
+  public void write(int fieldIndex, RowData rowData) {
+    if (rowData.isNullAt(fieldIndex)) {
+      writeNull();
+    } else {
+      setValue(valueCount, getValue(rowData, fieldIndex));
+      valueCount++;
+    }
+  }
+
+  /**
+   * A null struct row must still advance every child writer, keeping the
+   * children slot-aligned with the parent: arrow struct children carry one
+   * slot per parent row, and skipping the write leaves uninitialized
+   * memory in the child tail that later reads as garbage values.
+   */
+  @Override
+  public void writeNull() {
+    this.typedVector.setNull(valueCount);
+    for (int i = 0; i < fieldCount; ++i) {
+      fieldWriters.get(i).writeNull();
+    }
+    valueCount++;
   }
 
   @Override

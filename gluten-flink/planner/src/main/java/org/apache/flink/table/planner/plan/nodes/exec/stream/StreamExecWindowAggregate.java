@@ -168,6 +168,78 @@ public class StreamExecWindowAggregate extends StreamExecWindowAggregateBase {
     this.needRetraction = Optional.ofNullable(needRetraction).orElse(false);
   }
 
+  /** Builds merge-phase aggregates over a partial-result input schema. */
+  private static List<Aggregate> toMergeAggregates(
+      AggregateCall[] aggregateCalls,
+      io.github.zhztheplayer.velox4j.type.RowType partialsType,
+      int numGroupingKeys) {
+    List<Aggregate> merges = new java.util.ArrayList<>(aggregateCalls.length);
+    for (int i = 0; i < aggregateCalls.length; i++) {
+      AggregateCall call = aggregateCalls[i];
+      checkArgument(!call.isDistinct(), "distinct aggregate not supported in merge phase yet");
+      String fn = call.getAggregation().getName().toUpperCase(java.util.Locale.ROOT);
+      String mergeFn;
+      switch (fn) {
+        case "COUNT":
+        case "SUM":
+          mergeFn = "sum";
+          break;
+        case "MAX":
+          mergeFn = "max";
+          break;
+        case "MIN":
+          mergeFn = "min";
+          break;
+        default:
+          throw new UnsupportedOperationException(
+              "Window aggregate merge not supported for aggregate function: " + fn);
+      }
+      int fieldIndex = numGroupingKeys + i;
+      io.github.zhztheplayer.velox4j.type.Type fieldType =
+          partialsType.getChildren().get(fieldIndex);
+      String fieldName = partialsType.getNames().get(fieldIndex);
+      io.github.zhztheplayer.velox4j.expression.FieldAccessTypedExpr input =
+          io.github.zhztheplayer.velox4j.expression.FieldAccessTypedExpr.create(
+              fieldType, fieldName);
+      io.github.zhztheplayer.velox4j.expression.CallTypedExpr mergeCall =
+          new io.github.zhztheplayer.velox4j.expression.CallTypedExpr(
+              (io.github.zhztheplayer.velox4j.type.Type)
+                  org.apache.gluten.rexnode.RexNodeConverter.toType(call.getType()),
+              java.util.Collections.singletonList(input),
+              mergeFn);
+      merges.add(
+          new Aggregate(
+              mergeCall,
+              java.util.Collections.singletonList(fieldType),
+              null,
+              java.util.List.of(),
+              java.util.List.of(),
+              false));
+    }
+    return merges;
+  }
+
+  /** Output type of the local pre-aggregation: (grouping keys, agg values). */
+  private static io.github.zhztheplayer.velox4j.type.RowType buildLocalAggOutputType(
+      io.github.zhztheplayer.velox4j.type.RowType partialsType,
+      int numGroupingKeys,
+      AggregateCall[] aggregateCalls,
+      List<String> aggNames) {
+    List<String> names = new java.util.ArrayList<>();
+    List<io.github.zhztheplayer.velox4j.type.Type> types = new java.util.ArrayList<>();
+    for (int i = 0; i < numGroupingKeys; i++) {
+      names.add(partialsType.getNames().get(i));
+      types.add(partialsType.getChildren().get(i));
+    }
+    for (int i = 0; i < aggregateCalls.length; i++) {
+      names.add(aggNames.get(i));
+      types.add(
+          (io.github.zhztheplayer.velox4j.type.Type)
+              org.apache.gluten.rexnode.RexNodeConverter.toType(aggregateCalls[i].getType()));
+    }
+    return new io.github.zhztheplayer.velox4j.type.RowType(names, types);
+  }
+
   @SuppressWarnings("unchecked")
   @Override
   protected Transformation<RowData> translateToPlanInternal(
@@ -222,6 +294,15 @@ public class StreamExecWindowAggregate extends StreamExecWindowAggregateBase {
     PartitionFunctionSpec sliceAssignerSpec =
         new StreamWindowPartitionFunctionSpec(
             inputType, rowtimeIndex, size, slide, offset, windowType);
+    // The wrapped aggregation merges accumulator VALUES: the local
+    // pre-aggregator already evaluated the original aggregates over the
+    // raw rows, so the window operator must merge the partials (COUNT
+    // becomes SUM over partial counts) instead of recomputing them over
+    // accumulator rows (which would count the partial rows themselves).
+    io.github.zhztheplayer.velox4j.type.RowType localAggOutputType =
+        isRowTime
+            ? buildLocalAggOutputType(inputType, grouping.length, aggCalls, aggNames)
+            : inputType;
     PlanNode aggregation =
         new AggregationNode(
             PlanNodeIdGenerator.newId(),
@@ -229,9 +310,11 @@ public class StreamExecWindowAggregate extends StreamExecWindowAggregateBase {
             groupingKeys,
             isRowTime ? groupingKeys : List.of(),
             aggNames,
-            aggregates,
+            isRowTime
+                ? toMergeAggregates(aggCalls, localAggOutputType, grouping.length)
+                : aggregates,
             false,
-            List.of(new EmptyNode(inputType)),
+            List.of(new EmptyNode(isRowTime ? localAggOutputType : inputType)),
             null,
             List.of());
     // processing time window can not apply to local-global aggregate optimization, so here we need
@@ -268,7 +351,8 @@ public class StreamExecWindowAggregate extends StreamExecWindowAggregateBase {
             windowing.isRowtime(),
             rowtimeIndex,
             windowStartIndex,
-            windowEndIndex);
+            windowEndIndex,
+            true);
     final RowDataKeySelector selector =
         KeySelectorUtil.getRowDataSelector(
             planner.getFlinkContext().getClassLoader(),

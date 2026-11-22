@@ -75,6 +75,10 @@ public class WindowUtils {
       windowType = 2;
     } else if (windowSpec instanceof SessionWindowSpec) {
       windowType = 3;
+      // Session windows are sized by the gap: each record opens a tentative
+      // window [ts, ts + gap). The velox side carries the gap through the
+      // size channel and merges overlapping windows per key.
+      size = ((SessionWindowSpec) windowSpec).getGap().toMillis();
     } else {
       throw new RuntimeException("Not support window spec " + windowSpec);
     }

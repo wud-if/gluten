@@ -174,7 +174,7 @@ public class RexCallConverterFactory {
           // FLOOR/CEIL/ROUND arrive upper-cased from the operator table;
           // unary minus arrives as a one-operand "-" (see above).
           Map.entry("ABS", Arrays.asList(() -> new DefaultRexCallConverter("abs"))),
-          Map.entry("FLOOR", Arrays.asList(() -> new NumericOnlyRexCallConverter("floor"))),
+          Map.entry("FLOOR", Arrays.asList(() -> new FloorRexCallConverter(), () -> new NumericOnlyRexCallConverter("floor"))),
           Map.entry("CEIL", Arrays.asList(() -> new NumericOnlyRexCallConverter("ceil"))),
           Map.entry("ROUND", Arrays.asList(() -> new DecimalPostCastRexCallConverter("round"))),
           // Offload targets implemented in velox's flinksql namespace;

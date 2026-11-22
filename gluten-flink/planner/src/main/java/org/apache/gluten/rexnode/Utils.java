@@ -73,6 +73,8 @@ public class Utils {
       return JoinType.RIGHT;
     } else if (flinkJoinType == FlinkJoinType.FULL) {
       return JoinType.FULL;
+    } else if (flinkJoinType == FlinkJoinType.SEMI) {
+      return JoinType.LEFT_SEMI_FILTER;
     } else if (flinkJoinType == FlinkJoinType.ANTI) {
       return JoinType.ANTI;
     } else {
